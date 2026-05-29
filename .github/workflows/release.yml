@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# OB-357 sub-task 3d release pipeline.
+#
+# Tag a release (vX.Y.Z) → this workflow publishes a Release on GitHub AND
+# moves the major tag (v1) to point at the new tag, so customers who pin to
+# `@v1` get the new release transparently.
+
+permissions:
+  contents: write   # required to create GitHub Release + move tags
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version parts
+        id: ver
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          MAJOR=$(echo "$TAG" | sed -E 's/^v([0-9]+)\..*/v\1/')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+
+      - name: Move major-version alias tag
+        env:
+          MAJOR: ${{ steps.ver.outputs.major }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -f "$MAJOR" "$TAG"
+          git push origin "$MAJOR" --force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true

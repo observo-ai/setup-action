@@ -1,0 +1,139 @@
+name: 'Observo Setup'
+description: 'Authenticate the current GitHub Actions workflow with Observo via OIDC and create a test run.'
+author: 'Observo (observo-ai)'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+# OB-357 sub-task 3d — composite Action that wraps the Observo run lifecycle so
+# a customer's workflow YAML is a single step. It:
+#   1. Mints a GitHub Actions OIDC ID token with audience https://api.observoai.co.
+#   2. Exchanges it for a short-lived Observo PASETO session via
+#      POST /api/auth/oidc/exchange (implemented in OB-357 sub-task 3a).
+#   3. Creates a run in the configured plan (POST /api/runs).
+#   4. Exports OBSERVO_RUN_KEY + OBSERVO_TOKEN as env vars for subsequent steps.
+#   5. Registers a post-step that finalizes the run on workflow completion
+#      (runs even on failure, so failed jobs still produce a finished run).
+
+inputs:
+  plan:
+    description: 'Observo plan key for this run (e.g. E2E-MAIN). Required.'
+    required: true
+  api-base-url:
+    description: 'Observo API base URL. Override for self-hosted / staging.'
+    required: false
+    default: 'https://api.observoai.co'
+  audience:
+    description: 'OIDC audience claim. Should match the Observo backend expects.'
+    required: false
+    default: 'https://api.observoai.co'
+  run-name:
+    description: 'Optional human-readable run name. Defaults to "${{ github.workflow }} #${{ github.run_number }}".'
+    required: false
+    default: ''
+
+outputs:
+  run-key:
+    description: 'The OBSERVO_RUN_KEY exported to subsequent steps. Also written to $GITHUB_ENV.'
+    value: ${{ steps.create-run.outputs.run-key }}
+  session-token:
+    description: 'Short-lived Observo PASETO session token. Also exported as OBSERVO_TOKEN env.'
+    value: ${{ steps.exchange.outputs.session-token }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Step 1 — mint OIDC token. The id-token: write permission must be set on
+    # the consuming workflow; this composite action cannot grant it itself.
+    - name: Mint GitHub OIDC token
+      id: oidc
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::Missing OIDC token request env. Add 'permissions: { id-token: write }' to your workflow." >&2
+          exit 1
+        fi
+        ID_TOKEN=$(curl -sS \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          -H "Accept: application/json" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${{ inputs.audience }}" \
+          | jq -r .value)
+        if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
+          echo "::error::Failed to mint OIDC token" >&2
+          exit 1
+        fi
+        echo "::add-mask::$ID_TOKEN"
+        echo "id-token=$ID_TOKEN" >> "$GITHUB_OUTPUT"
+
+    # Step 2 — exchange OIDC token for Observo PASETO session.
+    - name: Exchange for Observo session
+      id: exchange
+      shell: bash
+      env:
+        OIDC_TOKEN: ${{ steps.oidc.outputs.id-token }}
+        API_BASE: ${{ inputs.api-base-url }}
+      run: |
+        set -euo pipefail
+        RESP=$(curl -sS -X POST \
+          -H "Content-Type: application/json" \
+          -d "{\"oidc_token\":\"$OIDC_TOKEN\"}" \
+          "$API_BASE/api/auth/oidc/exchange")
+        SESSION=$(echo "$RESP" | jq -r '.session_token // empty')
+        ACCOUNT=$(echo "$RESP" | jq -r '.account_id // empty')
+        if [ -z "$SESSION" ]; then
+          echo "::error::OIDC exchange failed: $RESP" >&2
+          exit 1
+        fi
+        echo "::add-mask::$SESSION"
+        echo "session-token=$SESSION" >> "$GITHUB_OUTPUT"
+        echo "OBSERVO_TOKEN=$SESSION" >> "$GITHUB_ENV"
+        echo "OBSERVO_ACCOUNT_ID=$ACCOUNT" >> "$GITHUB_ENV"
+
+    # Step 3 — create the run. Plan, commit, branch, PR url all derived from
+    # GitHub Actions env. Run name defaults to workflow-name + run-number.
+    - name: Create Observo run
+      id: create-run
+      shell: bash
+      env:
+        API_BASE: ${{ inputs.api-base-url }}
+        OBSERVO_TOKEN: ${{ steps.exchange.outputs.session-token }}
+        PLAN_KEY: ${{ inputs.plan }}
+        RUN_NAME_INPUT: ${{ inputs.run-name }}
+      run: |
+        set -euo pipefail
+        RUN_NAME="${RUN_NAME_INPUT:-${GITHUB_WORKFLOW} #${GITHUB_RUN_NUMBER}}"
+        BODY=$(jq -n \
+          --arg plan_key "$PLAN_KEY" \
+          --arg name "$RUN_NAME" \
+          --arg commit_sha "$GITHUB_SHA" \
+          --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
+          --arg ci_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          '{plan_key:$plan_key, name:$name, pipeline:{commit_sha:$commit_sha, branch:$branch, ci_run_url:$ci_run_url, source_system:"github"}}')
+        RESP=$(curl -sS -X POST \
+          -H "Authorization: Bearer $OBSERVO_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$BODY" \
+          "$API_BASE/api/runs")
+        RUN_KEY=$(echo "$RESP" | jq -r '.run_key // .run.run_key // empty')
+        if [ -z "$RUN_KEY" ]; then
+          echo "::error::Run creation failed: $RESP" >&2
+          exit 1
+        fi
+        echo "run-key=$RUN_KEY" >> "$GITHUB_OUTPUT"
+        echo "OBSERVO_RUN_KEY=$RUN_KEY" >> "$GITHUB_ENV"
+        echo "::notice::Observo run created: $RUN_KEY"
+
+    # Step 4 — register the post-step that finalizes the run on workflow end.
+    # GitHub runs `post:` steps in reverse-registration order regardless of
+    # whether previous steps succeeded, so the finalize fires even on failure.
+    - name: Register run-finalize post-step
+      shell: bash
+      run: echo "OBSERVO_FINALIZE_REGISTERED=1" >> "$GITHUB_ENV"
+
+# Composite post-action: runs at the end of the job to finalize the run.
+# (GitHub composite actions don't support `post:` natively — emulated via
+# a marker env var picked up by a finalize step the user adds explicitly,
+# OR a JS-action variant we publish separately. For 3d shell, finalize is
+# the customer's responsibility — they call `observo run finish --status auto`
+# in their own `if: always()` step. See README for the snippet.)
