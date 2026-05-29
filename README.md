@@ -6,7 +6,7 @@ Use it instead of manually plumbing an `OBSERVO_API_KEY` secret + `observo run c
 
 ## Prerequisites
 
-1. Install the **Observo for GitHub** App on your org / user account ([github.com/apps/observo](https://github.com/apps/observo)).
+1. Install the **Observo for GitHub** App on your org / user account ([github.com/apps/observo-ai](https://github.com/apps/observo-ai)).
 2. After install, visit `observoai.co/install/complete` while logged into Observo to bind the installation to your account.
 3. Your workflow must request the `id-token: write` permission (composite actions can't grant it for you).
 
